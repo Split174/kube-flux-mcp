@@ -15,7 +15,6 @@ import (
 )
 
 
-
 type ResourceKey struct {
 	Kind      string
 	Namespace string
@@ -44,8 +43,6 @@ type K8sManifest struct {
 	} `yaml:"spec"`
 }
 
-
-
 type Index struct {
 	Resources map[ResourceKey]*Resource
 }
@@ -57,8 +54,6 @@ func NewIndex() *Index {
 }
 
 func (idx *Index) Build(rootPath string) error {
-	fmt.Fprintf(os.Stderr, "🚀 [DEBUG] Начинаем сканирование папки: %s\n", rootPath)
-
 	return filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -67,15 +62,14 @@ func (idx *Index) Build(rootPath string) error {
 		name := info.Name()
 
 		// 1. Игнорируем ВСЕ скрытые файлы и папки (начинаются с точки)
-		// Проверка name != "." нужна, чтобы не пропустить корень проекта
 		if strings.HasPrefix(name, ".") && name != "." {
 			if info.IsDir() {
-				return filepath.SkipDir // Полностью пропускаем скрытую папку
+				return filepath.SkipDir
 			}
-			return nil // Пропускаем скрытый файл
+			return nil
 		}
 
-		// 2. Игнорируем папки с зависимостями мусором
+		// 2. Игнорируем папки с зависимостями/мусором
 		if info.IsDir() {
 			if name == "vendor" || name == "node_modules" {
 				return filepath.SkipDir
@@ -149,7 +143,6 @@ func (idx *Index) Build(rootPath string) error {
 	})
 }
 
-
 func getArgs(req mcp.CallToolRequest) map[string]interface{} {
 	if args, ok := req.Params.Arguments.(map[string]interface{}); ok {
 		return args
@@ -157,41 +150,25 @@ func getArgs(req mcp.CallToolRequest) map[string]interface{} {
 	return make(map[string]interface{})
 }
 
-
-
 func main() {
 	projectRoot := os.Getenv("PROJECT_ROOT")
 	if projectRoot == "" {
 		projectRoot, _ = os.Getwd()
 	}
 
-
-	var index *Index
-	var indexLoaded bool
-
-
+	// Теперь функция КАЖДЫЙ РАЗ строит свежий индекс
 	getIndex := func() (*Index, error) {
-		if indexLoaded {
-			return index, nil
-		}
-
 		idx := NewIndex()
-
-		fmt.Fprintf(os.Stderr, "Lazy indexing started for: %s\n", projectRoot)
-
+		// Сканируем файлы в реальном времени
 		if err := idx.Build(projectRoot); err != nil {
 			return nil, err
 		}
-
-		index = idx
-		indexLoaded = true
-		fmt.Fprintf(os.Stderr, "Lazy indexing finished. Found %d resources.\n", len(index.Resources))
-		return index, nil
+		return idx, nil
 	}
 
-	mcpServer := server.NewMCPServer("flux-yaml-indexer", "1.0.1")
+	mcpServer := server.NewMCPServer("flux-yaml-indexer", "1.1.1")
 
-
+	// --- ИНСТРУМЕНТ 1: list_resources ---
 	mcpServer.AddTool(mcp.Tool{
 		Name:        "list_resources",
 		Description: "List all GitOps/Kubernetes resources in the repository grouped by Kind.",
@@ -224,7 +201,7 @@ func main() {
 		return mcp.NewToolResultText(fmt.Sprintf("Found %d resources:\n%s", count, result.String())), nil
 	})
 
-
+	// --- ИНСТРУМЕНТ 2: get_resource_yaml ---
 	mcpServer.AddTool(mcp.Tool{
 		Name:        "get_resource_yaml",
 		Description: "Get the exact, raw YAML of a specific resource. Use this instead of reading files.",
@@ -258,7 +235,7 @@ func main() {
 		return mcp.NewToolResultText(fmt.Sprintf("Resource %s/%s of kind %s not found.", ns, name, kind)), nil
 	})
 
-
+	// --- ИНСТРУМЕНТ 3: get_flux_dependencies ---
 	mcpServer.AddTool(mcp.Tool{
 		Name:        "get_flux_dependencies",
 		Description: "Get upstream resources this resource depends on.",
@@ -298,6 +275,62 @@ func main() {
 			b.WriteString(fmt.Sprintf("- [%s] %s/%s\n", dep.Kind, dep.Namespace, dep.Name))
 		}
 		return mcp.NewToolResultText(b.String()), nil
+	})
+
+	// --- ИНСТРУМЕНТ 4: get_helm_values ---
+	mcpServer.AddTool(mcp.Tool{
+		Name:        "get_helm_values",
+		Description: "Extracts ONLY the spec.values segment from a HelmRelease.",
+		InputSchema: mcp.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]interface{}{
+				"name":      map[string]interface{}{"type": "string"},
+				"namespace": map[string]interface{}{"type": "string", "default": "default"},
+			},
+			Required: []string{"name"},
+		},
+	}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		idx, err := getIndex()
+		if err != nil {
+			return mcp.NewToolResultText("Error building index"), nil
+		}
+
+		args := getArgs(request)
+		name, _ := args["name"].(string)
+		ns, ok := args["namespace"].(string)
+		if !ok || ns == "" {
+			ns = "default"
+		}
+
+		key := ResourceKey{Kind: "HelmRelease", Namespace: ns, Name: name}
+		res, exists := idx.Resources[key]
+		if !exists {
+			return mcp.NewToolResultText(fmt.Sprintf("HelmRelease %s/%s not found.", ns, name)), nil
+		}
+
+		var tempManifest struct {
+			Spec struct {
+				Values interface{} `yaml:"values"`
+			} `yaml:"spec"`
+		}
+
+		if err := yaml.Unmarshal([]byte(res.RawYAML), &tempManifest); err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("Failed to parse YAML for HelmRelease %s/%s: %v", ns, name, err)), nil
+		}
+
+		if tempManifest.Spec.Values == nil {
+			return mcp.NewToolResultText(fmt.Sprintf("HelmRelease %s/%s has no spec.values defined.", ns, name)), nil
+		}
+
+		var buf bytes.Buffer
+		yamlEncoder := yaml.NewEncoder(&buf)
+		yamlEncoder.SetIndent(2)
+		if err := yamlEncoder.Encode(tempManifest.Spec.Values); err != nil {
+			return mcp.NewToolResultText("Failed to encode values to string"), nil
+		}
+
+		header := fmt.Sprintf("# spec.values from HelmRelease: %s/%s\n", ns, name)
+		return mcp.NewToolResultText(header + buf.String()), nil
 	})
 
 	if err := server.ServeStdio(mcpServer); err != nil {
