@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Init Go module (if missing)
+        run: |
+          if [ ! -f go.mod ]; then go mod init kube-flux-mcp; fi
+          go mod tidy
+
+      - name: Build binaries
+        run: |
+          # Linux
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-w -s" -o kube-flux-mcp-linux-amd64 main.go
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-w -s" -o kube-flux-mcp-linux-arm64 main.go
+
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-w -s" -o kube-flux-mcp-windows-amd64.exe main.go
+
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-w -s" -o kube-flux-mcp-darwin-amd64 main.go
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-w -s" -o kube-flux-mcp-darwin-arm64 main.go
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kube-flux-mcp-linux-amd64
+            kube-flux-mcp-linux-arm64
+            kube-flux-mcp-windows-amd64.exe
+            kube-flux-mcp-darwin-amd64
+            kube-flux-mcp-darwin-arm64
+          generate_release_notes: true
