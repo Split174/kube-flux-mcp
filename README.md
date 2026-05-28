@@ -56,9 +56,12 @@ You don't need to build from source. Pre-compiled binaries for Linux, macOS, and
 		"kube-flux-mcp": {
 			"enabled": true,
 			"remote": false,
-			"command": "/home/serj/my-pets/flux-mcp-server/kube-flux-mcp",
+			"command": "/path/to/your/kube-flux-mcp",
 			"args": [],
-			"env": { "KUBECONFIG": ".private-files/gilfoyle.yaml" },
+			"env": {
+        "PROJECT_ROOT": "/path/to/your/gitops/repository",
+        "KUBECONFIG": ".kube/config"
+      }
 		},
 	},
 }
