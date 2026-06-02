@@ -5,12 +5,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"gopkg.in/yaml.v3"
@@ -30,7 +33,7 @@ import (
 )
 
 // ==========================================
-// 1. СТРУКТУРЫ И ЛОКАЛЬНЫЙ ПАРСЕР (DESIRED STATE)
+// 1. СТРУКТУРЫ И ЛОКАЛЬНЫЙ ИНДЕКС (DESIRED STATE)
 // ==========================================
 
 type ResourceKey struct {
@@ -106,11 +109,13 @@ func (idx *Index) Build(rootPath string) error {
 				break
 			}
 			if err != nil {
-				continue
+				break
 			}
 
 			var buf bytes.Buffer
-			yaml.NewEncoder(&buf).Encode(&node)
+			enc := yaml.NewEncoder(&buf)
+			enc.Encode(&node)
+			enc.Close()
 			rawDoc := buf.String()
 
 			var manifest K8sManifest
@@ -153,7 +158,92 @@ func (idx *Index) Build(rootPath string) error {
 }
 
 // ==========================================
-// 2. KUBERNETES КЛИЕНТ (ACTUAL STATE / LAZY INIT)
+// 2. WATCHER И ФОНОВОЕ ОБНОВЛЕНИЕ ИНДЕКСА
+// ==========================================
+
+var (
+	indexMutex  sync.RWMutex
+	globalIndex *Index
+)
+
+func initWatcher(projectRoot string) {
+	logger := log.New(os.Stderr, "[FS Watcher] ", log.LstdFlags)
+
+	idx := NewIndex()
+	if err := idx.Build(projectRoot); err != nil {
+		logger.Printf("Initial index build failed: %v", err)
+	}
+	globalIndex = idx
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logger.Printf("Failed to create watcher: %v", err)
+		return
+	}
+
+	// Хелпер для обхода подпапок и добавления их в watcher
+	addDirsToWatcher := func(root string) {
+		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				name := info.Name()
+				if (strings.HasPrefix(name, ".") && name != ".") || name == "vendor" || name == "node_modules" {
+					return filepath.SkipDir
+				}
+				watcher.Add(path)
+			}
+			return nil
+		})
+	}
+
+	addDirsToWatcher(projectRoot)
+
+	go func() {
+		defer watcher.Close()
+		var timer *time.Timer
+		delay := 500 * time.Millisecond
+
+		rebuildIndex := func() {
+			logger.Println("Files changed. Rebuilding index...")
+			newIdx := NewIndex()
+			newIdx.Build(projectRoot)
+
+			indexMutex.Lock()
+			globalIndex = newIdx
+			indexMutex.Unlock()
+
+			addDirsToWatcher(projectRoot)
+			logger.Println("Index successfully rebuilt.")
+		}
+
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+					if strings.HasSuffix(event.Name, ".yaml") || strings.HasSuffix(event.Name, ".yml") || !strings.Contains(filepath.Base(event.Name), ".") {
+						if timer != nil {
+							timer.Stop()
+						}
+						timer = time.AfterFunc(delay, rebuildIndex)
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				logger.Printf("Watcher error: %v", err)
+			}
+		}
+	}()
+}
+
+// ==========================================
+// 3. KUBERNETES КЛИЕНТ (ACTUAL STATE / LAZY INIT)
 // ==========================================
 
 var (
@@ -166,7 +256,6 @@ var (
 )
 
 // getK8s лениво инициализирует клиенты Kubernetes.
-// Ошибка возвращается как значение, чтобы не "ронять" сервер паникой.
 func getK8s() (*kubernetes.Clientset, dynamic.Interface, meta.RESTMapper, error) {
 	k8sMutex.Lock()
 	defer k8sMutex.Unlock()
@@ -229,7 +318,7 @@ func getArgs(req mcp.CallToolRequest) map[string]interface{} {
 }
 
 // ==========================================
-// 3. ТОЧКА ВХОДА (MAIN)
+// 4. ТОЧКА ВХОДА (MAIN)
 // ==========================================
 
 func main() {
@@ -238,13 +327,8 @@ func main() {
 		projectRoot, _ = os.Getwd()
 	}
 
-	getIndex := func() (*Index, error) {
-		idx := NewIndex()
-		if err := idx.Build(projectRoot); err != nil {
-			return nil, err
-		}
-		return idx, nil
-	}
+	// Инициализируем парсинг и фоновый watcher
+	initWatcher(projectRoot)
 
 	mcpServer := server.NewMCPServer("hybrid-gitops-agent", "2.0.0")
 
@@ -259,10 +343,11 @@ func main() {
 			},
 		},
 	}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		idx, err := getIndex()
-		if err != nil {
-			return mcp.NewToolResultText(fmt.Sprintf("Error building index: %v", err)), nil
-		}
+		// Читаем индекс под RWMutex
+		indexMutex.RLock()
+		idx := globalIndex
+		indexMutex.RUnlock()
+
 		args := getArgs(request)
 		filterKind, _ := args["kind"].(string)
 
@@ -291,10 +376,10 @@ func main() {
 			Required: []string{"kind", "name"},
 		},
 	}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		idx, err := getIndex()
-		if err != nil {
-			return mcp.NewToolResultText("Error building index"), nil
-		}
+		indexMutex.RLock()
+		idx := globalIndex
+		indexMutex.RUnlock()
+
 		args := getArgs(request)
 		kind, _ := args["kind"].(string)
 		name, _ := args["name"].(string)
@@ -323,7 +408,10 @@ func main() {
 			Required: []string{"name"},
 		},
 	}, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		idx, _ := getIndex()
+		indexMutex.RLock()
+		idx := globalIndex
+		indexMutex.RUnlock()
+
 		args := getArgs(request)
 		name, _ := args["name"].(string)
 		ns, _ := args["namespace"].(string)
@@ -383,7 +471,6 @@ func main() {
 			ns = "default"
 		}
 
-		// Динамический поиск GroupVersionResource по Kind
 		mapping, err := mapper.RESTMapping(schema.GroupKind{Kind: kind})
 		if err != nil {
 			return mcp.NewToolResultText(fmt.Sprintf("Failed to find API mapping for kind '%s': %v", kind, err)), nil
@@ -433,7 +520,7 @@ func main() {
 		for _, kind := range fluxKinds {
 			mapping, err := mapper.RESTMapping(schema.GroupKind{Kind: kind})
 			if err != nil {
-				continue // Flux CRD might not be installed
+				continue
 			}
 
 			var resClient dynamic.ResourceInterface
@@ -518,7 +605,6 @@ func main() {
 			tailLines = int64(linesFloat)
 		}
 
-		// Ищем под по префиксу
 		pods, err := clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return mcp.NewToolResultText(fmt.Sprintf("Failed to list pods in namespace %s: %v", ns, err)), nil
@@ -536,7 +622,6 @@ func main() {
 			return mcp.NewToolResultText(fmt.Sprintf("No pod starting with '%s' found in namespace '%s'.", prefix, ns)), nil
 		}
 
-		// Берем логи
 		logOptions := &corev1.PodLogOptions{
 			TailLines: &tailLines,
 		}
@@ -580,12 +665,11 @@ func main() {
 		kind, _ := args["kind"].(string)
 		name, _ := args["name"].(string)
 
-		warningOnly := true // По умолчанию только Warning
+		warningOnly := true
 		if wo, ok := args["warning_only"].(bool); ok {
 			warningOnly = wo
 		}
 
-		// Запрашиваем эвенты через стандартный CoreV1 API
 		eventsList, err := clientset.CoreV1().Events(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return mcp.NewToolResultText(fmt.Sprintf("Failed to list events in namespace '%s': %v", ns, err)), nil
@@ -593,16 +677,12 @@ func main() {
 
 		var filteredEvents []corev1.Event
 		for _, ev := range eventsList.Items {
-			// Фильтрация по типу
 			if warningOnly && ev.Type != "Warning" {
 				continue
 			}
-			// Фильтрация по Kind
 			if kind != "" && !strings.EqualFold(ev.InvolvedObject.Kind, kind) {
 				continue
 			}
-			// Фильтрация по Name (используем HasPrefix, чтобы при поиске Deployment=backend
-			// показать эвенты подов backend-xxxx-yyyy)
 			if name != "" && !strings.HasPrefix(ev.InvolvedObject.Name, name) {
 				continue
 			}
@@ -617,7 +697,6 @@ func main() {
 			return mcp.NewToolResultText(msg), nil
 		}
 
-		// Сортируем от самых свежих к старым
 		sort.Slice(filteredEvents, func(i, j int) bool {
 			t1 := filteredEvents[i].LastTimestamp.Time
 			if t1.IsZero() {
@@ -630,7 +709,6 @@ func main() {
 			return t1.After(t2)
 		})
 
-		// Лимитируем выдачу (бережем токены)
 		limit := 30
 		if len(filteredEvents) < limit {
 			limit = len(filteredEvents)
